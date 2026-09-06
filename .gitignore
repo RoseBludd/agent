@@ -7,3 +7,4 @@ src/embeddings/vector_db/*
 **/*.log
 .DS_Store
 **/samples/*
+logs/

@@ -1,3 +1,5 @@
+from src.settings import settings
+settings.qdrant_path = "/tmp/g3_vector_db"
 from src.tools.docs_search import DocsSearchTool
 t = DocsSearchTool()
 print('TOOL_INIT_OK')
