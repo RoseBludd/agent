@@ -38,9 +38,10 @@ class DocsSearchTool(Tool):
     output_type = "array"
 
     def __init__(self):
+        super().__init__()
         ensure_collection_exists()
         auto_embed_pipeline(
-            url=f"{settings.url}/llms.txt", hash_file=settings.hash_file
+            source_dir=settings.docs_reference_dir, hash_file=settings.hash_file
         )
         self.is_initialized = True
 

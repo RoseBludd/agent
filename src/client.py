@@ -1,156 +1,138 @@
+import json
 import os
-import atexit
+import subprocess
+import time
+from pathlib import Path
+from typing import Any, Optional
 
-from playwright.sync_api import sync_playwright, Playwright, Page, Browser
-from typing import Optional, List
 from loguru import logger
 
-from src.utils import clear_file_path
 from src.settings import settings
 
 
+class DapiError(RuntimeError):
+    pass
+
+
 class DiffusionClient:
-    """Client for the Diffusion Studio editor."""
+    """Drives a Diffusion Studio editor instance via the `dapi` CLI.
 
-    # Private attributes
-    _output: Optional[str] = None
-    _assets: Optional[list[str]] = None
+    Replaces the original Playwright/`window.core` integration: the editor
+    open-sourced its automation surface as a project folder of JSX plus the
+    `dapi` CLI (open/context/check/capture/export talking to a running app
+    over a local socket) rather than a headless-browser `window.core` global
+    (grep of the whole editor-fork git history found no trace of
+    `window.core` ever existing there -- it targeted a different, no-longer-
+    reachable hosted build). This client writes the composition as JSX to
+    the project's entry file and shells out to `dapi` for everything else.
+    """
 
-    # Public attributes
-    browser: Browser
-    page: Page
-    samples: List[str] = []
-    executable_path = settings.playwright_chromium_executable_path
-    web_socket_url = settings.playwright_web_socket_url
+    def __init__(
+        self,
+        project_dir: Optional[str] = None,
+        cli_path: Optional[str] = None,
+        entry_file: str = "index.tsx",
+    ):
+        self.project_dir = Path(project_dir or settings.dapi_project_dir).resolve()
+        self.cli_path = cli_path or settings.dapi_cli_path
+        self.entry_file = entry_file
+        self.project_dir.mkdir(parents=True, exist_ok=True)
+        self._opened = False
 
-    def __init__(self):
-        """Initialize the Diffusion Studio client."""
-        self.playwright = sync_playwright().start()
-        self.init(self.playwright)
-        atexit.register(self.close)  # Auto-close on exit
+    # -- low level -----------------------------------------------------
 
-    def init(self, playwright: Playwright):
-        """Connects to the remote browser with API key. And sets up the editor."""
-        try:
-            if self.web_socket_url:
-                self.browser = playwright.chromium.connect_over_cdp(self.web_socket_url)
-                logger.debug("Connected to remote browser via cdp")
-            else:
-                self.browser = playwright.chromium.launch(
-                    executable_path=self.executable_path
-                )
-                logger.debug("Local browser launched")
+    def _run(self, args: list[str], timeout: int = 90) -> str:
+        cmd = ["node", self.cli_path, *args]
+        logger.debug(f"dapi: {' '.join(cmd)}")
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+        if proc.returncode != 0:
+            raise DapiError(
+                f"dapi {' '.join(args)} failed: {proc.stderr.strip() or proc.stdout.strip()}"
+            )
+        return proc.stdout.strip()
 
-            self.page = self.browser.new_page()
+    def _run_json(self, args: list[str], timeout: int = 90) -> Any:
+        out = self._run(args, timeout=timeout)
+        lines = [line for line in out.splitlines() if line.strip()]
+        if not lines:
+            return None
+        if len(lines) == 1:
+            return json.loads(lines[0])
+        return [json.loads(line) for line in lines]
 
-            logger.info("Loading editor interface...")
-            self.page.goto(settings.url)
-            self.page.wait_for_function("typeof window.core !== 'undefined'")
-            logger.debug("Editor interface loaded")
+    # -- lifecycle -------------------------------------------------------
 
-            self.page.on("console", lambda msg: logger.debug(f"[Browser]: {msg.text}"))
-            self.page.expose_function("saveChunk", self._save_chunk)
-            logger.debug("Exposed save_chunk function to browser")
+    def ensure_open(self) -> dict:
+        """Opens (or creates) the project folder in the running app.
 
-            self.page.expose_function("saveSample", self._save_sample)
-            logger.debug("Exposed save_sample function to browser")
-
-        except Exception as e:
-            logger.exception(f"Failed to launch editor: {str(e)}")
-            raise
-
-    def _save_chunk(self, data: list[int], position: int) -> None:
-        """Writes the received video chunk at the specified position."""
-        if not self.output:
-            logger.error("Output path not set when trying to save chunk")
-            raise ValueError("Output path not set")
-
-        try:
-            if not os.path.exists(self.output):
-                with open(self.output, "wb") as f:
-                    pass
-                logger.debug(f"Created empty output file: {self.output}")
-
-            with open(self.output, "r+b") as f:
-                f.seek(position)
-                f.write(bytearray(data))
-        except Exception as e:
-            logger.error(f"Failed to save chunk: {str(e)}")
-            raise
-
-    def _save_sample(self, data: str) -> None:
-        """Saves a sample video to the output directory."""
-        self.samples.append(data.replace("data:image/jpeg;base64,", ""))
-
-    @property
-    def output(self) -> Optional[str]:
-        return self._output
-
-    @output.setter
-    def output(self, value: Optional[str]) -> None:
-        if value:
-            clear_file_path(value)
-        self._output = value
-
-    def evaluate(self, javascript: str) -> str:
-        """Evaluates the JavaScript code in the browser."""
-
-        self.samples = []  # Reset samples
-
-        if not self.page:
-            logger.error("Page not initialized when trying to evaluate JavaScript")
-            raise ValueError("Page not initialized")
-
-        try:
-            logger.info("Client evaluating JavaScript code...")
-
-            # Wrap the code in an async IIFE (Immediately Invoked Function Expression)
-            wrapped_code = f"""
-            (async () => {{
-                try {{
-                    {javascript}
-                    return 'success';
-                }} catch (e) {{
-                    console.error(e.message);
-                    console.error(e.stack);
-                    return 'error: ' + e.message;
-                }}
-            }})()
-            """
-
-            result = self.page.evaluate(wrapped_code)
-
-            if not isinstance(result, str):
-                result = "error"
-
-            logger.debug(f"JavaScript evaluation result: {result}")
-            return result
-
-        except Exception as e:
-            return str(e)
+        The app itself must already be running (headless, under Xvfb on
+        Linux -- `dapi open` only auto-launches the app on macOS); the
+        service that owns this client is responsible for keeping that
+        process alive.
+        """
+        result = self._run_json(["open", "-b", str(self.project_dir)])
+        self._opened = True
+        logger.info(f"dapi open: {result}")
+        return result
 
     def upload_assets(self, assets: list[str]) -> None:
-        """Uploads the assets to the editor."""
+        """No-op placeholder kept for tool-call compatibility.
 
-        # If the assets are the same as the previous ones, do nothing
-        if assets == self._assets:
-            return
+        Assets are referenced directly by absolute path in JSX `src` props
+        (see editor-fork/reference/jsx/media.md -- "Global path" resolution),
+        so there is no separate upload step against a browser file input.
+        """
+        return None
 
-        input_element = self.page.locator("#file-input")
-        input_element.set_input_files(assets[0])
+    # -- composition -----------------------------------------------------
 
-        self._assets = assets
+    def write_project(self, jsx: str) -> None:
+        """Writes the project's entry file. The app watches the folder and
+        recompiles + remounts on save (see reference/jsx/README.md pipeline)."""
+        if not self._opened:
+            self.ensure_open()
+        path = self.project_dir / self.entry_file
+        path.write_text(jsx)
+        logger.debug(f"Wrote {len(jsx)} bytes to {path}")
+        # Give the app's file watcher + esbuild compile a moment to land
+        # before a caller immediately calls context/check/capture.
+        time.sleep(1.5)
 
-    def close(self):
-        """Closes the browser and playwright."""
-        try:
-            if hasattr(self, "browser") and self.browser:
-                self.browser.close()
-                logger.debug("Browser closed")
-            if hasattr(self, "playwright") and self.playwright:
-                self.playwright.stop()
-                logger.debug("Playwright stopped")
-        except Exception as e:
-            logger.error(f"Error during cleanup: {str(e)}")
-            # Suppress errors during shutdown
-            pass
+    def context(self) -> dict:
+        return self._run_json(["context"])
+
+    def check(self, node_id: str) -> dict:
+        return self._run_json(["check", node_id])
+
+    def capture(
+        self, scene_id: str, times: Optional[list[str]] = None, output_dir: Optional[str] = None
+    ) -> list[dict]:
+        """Renders frames of a scene to contact-sheet PNG(s) and returns
+        their paths. Mirrors what an export would encode at each position."""
+        out_dir = Path(output_dir or (self.project_dir / ".captures"))
+        out_dir.mkdir(parents=True, exist_ok=True)
+        args = ["capture", scene_id, "-o", str(out_dir)]
+        if times:
+            args += ["-t", *times]
+        result = self._run_json(args, timeout=120)
+        if isinstance(result, dict):
+            result = [result]
+        return result or []
+
+    def export(self, scene_id: str, output: str) -> dict:
+        """Encodes a scene to a video file on disk. Waits for the CLI's own
+        render loop rather than polling (the CLI blocks until it's done,
+        up to its own 60-minute ceiling)."""
+        out_path = Path(output)
+        if not out_path.is_absolute():
+            out_path = self.project_dir / out_path
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        result = self._run_json(["export", scene_id, str(out_path)], timeout=3600)
+        logger.info(f"dapi export: {result}")
+        return result
+
+    def close(self) -> None:
+        """The app process is a shared, long-lived host service (one
+        browser/editor session per host, per the WO's v1 scope) -- this
+        client does not own its lifecycle and does not stop it."""
+        return None

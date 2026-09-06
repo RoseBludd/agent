@@ -237,9 +237,17 @@ def generate_embeddings(
     """
     from openai import OpenAI
 
-    client = OpenAI(
-        api_key=settings.infinity_api_key, base_url=settings.infinity_base_url
-    )
+    if settings.embedding_provider == "cloudflare":
+        # Routed through the CADIS gateway's own /v1/embeddings passthrough to
+        # Workers AI's @cf/baai/bge-m3 (1024-dim, matches embedding_dim) rather than
+        # a second direct-to-Cloudflare-API client -- one gateway, one credential.
+        client = OpenAI(api_key=settings.cadis_api_key or "unused", base_url=settings.cadis_gateway_url)
+        embedding_model = "bge-m3"
+    else:
+        client = OpenAI(
+            api_key=settings.infinity_api_key, base_url=settings.infinity_base_url
+        )
+        embedding_model = settings.infinity_embedding_model
     last_error = None
 
     for attempt in range(retries):
@@ -247,10 +255,39 @@ def generate_embeddings(
             logger.debug(
                 f"Making embedding request with {len(text) if isinstance(text, list) else 1} texts"
             )
-            response = client.embeddings.create(
-                model=settings.infinity_embedding_model,
-                input=text if isinstance(text, list) else [text],
-            )
+            input_texts = text if isinstance(text, list) else [text]
+            try:
+                response = client.embeddings.create(
+                    model=embedding_model,
+                    input=input_texts,
+                )
+            except Exception as ctx_err:
+                # Gateway models cap total batch context (e.g. bge-m3 60k tokens).
+                # Halve the batch and recurse so large corpora still embed.
+                if "Max context" in str(ctx_err) and len(input_texts) > 1:
+                    mid = len(input_texts) // 2
+                    logger.warning(
+                        f"Embedding batch of {len(input_texts)} exceeded model context; "
+                        f"splitting into {mid}+{len(input_texts) - mid}"
+                    )
+                    return generate_embeddings(input_texts[:mid]) + generate_embeddings(
+                        input_texts[mid:]
+                    )
+                if "Max context" in str(ctx_err) and len(input_texts) == 1:
+                    # Single oversized chunk: truncate (~4 chars/token heuristic,
+                    # 150k chars ~= 37k tokens, safely under the 60k cap)
+                    max_chars = 150_000
+                    truncated = input_texts[0][:max_chars]
+                    logger.warning(
+                        f"Embedding chunk of {len(input_texts[0])} chars exceeded model "
+                        f"context; truncated to {len(truncated)} chars"
+                    )
+                    response = client.embeddings.create(
+                        model=embedding_model,
+                        input=[truncated],
+                    )
+                else:
+                    raise
             embeddings = [data.embedding for data in response.data]
             logger.debug("Got embeddings successfully")
             return embeddings
@@ -492,6 +529,36 @@ def fetch_and_hash_content(url: str) -> tuple[str, str]:
         return content, content_hash
 
 
+def build_local_docs_corpus(source_dir: str) -> str:
+    """Concatenates every markdown file under source_dir into the same
+    "# relative/path.md\n\n<content>\n\n---\n\n" shape split_by_separator()
+    expects, so the local reference docs feed the existing chunk/embed
+    pipeline unchanged.
+
+    The upstream diffusionstudio/agent's original doc source
+    (operator.diffusion.studio's concatenated-docs endpoint) no longer
+    resolves, and the current diffusion.studio/llms.txt is a marketing-site
+    link index, not JSX/dapi reference content -- the real reference lives
+    in the editor-fork repo's reference/ folder (the same docs staged into
+    every opened project's .diffusion/docs/), so that's what's indexed here.
+    """
+    root = Path(source_dir)
+    parts = []
+    for path in sorted(root.rglob("*.md")):
+        rel = path.relative_to(root).as_posix()
+        text = path.read_text(encoding="utf-8", errors="replace")
+        parts.append(f"# {rel}\n\n{text}")
+    return "\n\n---\n\n".join(parts)
+
+
+def fetch_and_hash_local_docs(source_dir: str) -> tuple[str, str]:
+    """Local-directory counterpart to fetch_and_hash_content()."""
+    content = ftfy.fix_text(build_local_docs_corpus(source_dir))
+    content = unicodedata.normalize("NFKC", content)
+    content_hash = hashlib.sha256(content.encode("utf-8")).hexdigest()
+    return content, content_hash
+
+
 def upload_points_batch(points: List[PointStruct]):
     """Upload a batch of points to Qdrant."""
     try:
@@ -508,22 +575,33 @@ def upload_points_batch(points: List[PointStruct]):
 
 
 def auto_embed_pipeline(
-    url: str,
+    url: Optional[str] = None,
+    source_dir: Optional[str] = None,
     hash_file: str = "docs/content_hash.txt",
     debug: bool = False,
     force: bool = False,
 ):
-    """Automated pipeline to fetch, check hash, and embed content if changed."""
+    """Automated pipeline to fetch, check hash, and embed content if changed.
+
+    Exactly one of `url` (remote fetch) or `source_dir` (local markdown tree,
+    see build_local_docs_corpus) must be given.
+    """
+    if not url and not source_dir:
+        raise ValueError("auto_embed_pipeline requires either url or source_dir")
+    source = url or source_dir
     try:
         logger.info(
-            f"Starting auto-embed pipeline for {url}{' (DEBUG MODE)' if debug else ''}{' (FORCE UPDATE)' if force else ''}"
+            f"Starting auto-embed pipeline for {source}{' (DEBUG MODE)' if debug else ''}{' (FORCE UPDATE)' if force else ''}"
         )
 
         # Ensure collection exists
         ensure_collection_exists()
 
         # Fetch content and generate hash
-        content, new_hash = fetch_and_hash_content(url)
+        if source_dir:
+            content, new_hash = fetch_and_hash_local_docs(source_dir)
+        else:
+            content, new_hash = fetch_and_hash_content(url)
         logger.info(f"Generated hash: {new_hash}")
 
         # Initialize hash path
@@ -539,7 +617,7 @@ def auto_embed_pipeline(
                 results = client.query_points(
                     collection_name=settings.collection_name,
                     query_filter=Filter(
-                        must=[FieldCondition(key="source", match=MatchText(text=url))]
+                        must=[FieldCondition(key="source", match=MatchText(text=source))]
                     ),
                     limit=1,
                 )
@@ -579,10 +657,10 @@ def auto_embed_pipeline(
             client.delete(
                 collection_name=settings.collection_name,
                 points_selector=Filter(
-                    must=[FieldCondition(key="source", match=MatchText(text=url))]
+                    must=[FieldCondition(key="source", match=MatchText(text=source))]
                 ),
             )
-            logger.info(f"Cleared existing content for {url}")
+            logger.info(f"Cleared existing content for {source}")
         except Exception as e:
             logger.warning(f"Failed to clear existing content: {str(e)}")
 
@@ -595,7 +673,7 @@ def auto_embed_pipeline(
             logger.info(f"Split content into {len(chunks)} chunks")
 
         # Process chunks in batches
-        batch_size = 32
+        batch_size = int(os.getenv("EMBED_BATCH_SIZE", "8"))
         points = []
         chunks_to_embed = []
         chunk_metadata = []  # Store metadata for each chunk
@@ -612,7 +690,7 @@ def auto_embed_pipeline(
                 # Store chunk and metadata for batch processing
                 chunks_to_embed.append(chunk)
                 chunk_metadata.append(
-                    {"index": i, "filename": filename or url, "chunk": chunk}
+                    {"index": i, "filename": filename or source, "chunk": chunk}
                 )
 
                 # Process batch when full
@@ -630,7 +708,7 @@ def auto_embed_pipeline(
                                     "file_id": f"url_content#{meta['index']}",
                                     "filename": meta["filename"],
                                     "filepath": meta["filename"],
-                                    "source": url,
+                                    "source": source,
                                     "chunk_index": meta["index"],
                                     "total_chunks": len(chunks),
                                     "original_content": meta["chunk"],
@@ -666,7 +744,7 @@ def auto_embed_pipeline(
                                 "file_id": f"url_content#{meta['index']}",
                                 "filename": meta["filename"],
                                 "filepath": meta["filename"],
-                                "source": url,
+                                "source": source,
                                 "chunk_index": meta["index"],
                                 "total_chunks": len(chunks),
                                 "original_content": meta["chunk"],
@@ -990,7 +1068,9 @@ def main():
     args = parser.parse_args()
 
     if args.command == "auto-embed":
-        auto_embed_pipeline(args.url, args.hash_file, args.debug, args.force)
+        auto_embed_pipeline(
+            url=args.url, hash_file=args.hash_file, debug=args.debug, force=args.force
+        )
     elif args.command == "search":
         filter_conditions = {}
         if args.filepath:
