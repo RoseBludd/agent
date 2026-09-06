@@ -11,15 +11,15 @@ from src.tools import (
     VisualFeedbackTool,
 )
 
-# Every LiteLLM call (model, api_base, tokens) logged to disk -- evidence that
-# inference is actually routed through the CADIS gateway rather than direct
-# to a provider.
-os.environ.setdefault("LITELLM_LOG", "DEBUG")
+# Every LiteLLM call (model, api_base) logged to disk -- evidence that inference
+# is actually routed through the CADIS gateway rather than direct to a provider.
+# Level is INFO deliberately: DEBUG payloads dump the api_key into the log file.
+os.environ.setdefault("LITELLM_LOG", "INFO")
 os.makedirs("logs", exist_ok=True)
 _litellm_file_handler = logging.FileHandler("logs/litellm_calls.log")
 _litellm_file_handler.setFormatter(logging.Formatter("%(asctime)s %(name)s %(message)s"))
 logging.getLogger("LiteLLM").addHandler(_litellm_file_handler)
-logging.getLogger("LiteLLM").setLevel(logging.DEBUG)
+logging.getLogger("LiteLLM").setLevel(logging.INFO)
 
 client = DiffusionClient()
 
@@ -41,6 +41,7 @@ agent = CodeAgent(
         temperature=0.0,
     ),
     system_prompt=get_system_prompt(),
+    max_steps=15,
 )
 
 if __name__ == "__main__":

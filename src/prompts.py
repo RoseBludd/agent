@@ -47,6 +47,29 @@ export default function Project() {
 - `<text>` draws nothing without a `color` (or a paint child) -- always set one.
 - Use the docs_search_tool for anything else (elements, timing, animations, transitions,
   keyframes): query it with e.g. "video element props", "how to add text overlay", "timing".
+
+### How to pass JSX to video_editor_tool (CRITICAL -- read before every call)
+Embed the JSX in ONE triple-double-quoted Python string and emit the JSX characters RAW:
+- NEVER backslash-escape quotes inside the JSX (no backslash-quote sequences).
+- NEVER wrap the JSX in single quotes, and never split it across + concatenations.
+- Keep the whole JSX in one code blob; do not echo it back in your final answer.
+
+Correct code blob (note: JSX keeps its own double quotes untouched inside the triple-quoted string):
+```py
+jsx = \"\"\"<stage background="#161616">
+<scene id="main" name="Main" width={1920} height={1080} fill="black" active>
+<video src="/abs/path/clip.mp4" start={0} end={5} width={1920} height={1080} />
+<text width={1920} textAlign="center" fontSize={96} color="#FFFFFF" start={0} end={5}>Hello</text>
+</scene>
+</stage>\"\"\"
+video_editor_tool(jsx=jsx)
+```
+
+Invalid (these caused past `unterminated string literal` / `code blob is invalid` failures):
+```py
+jsx = "<stage background=\\"#161616\\">"    # FORBIDDEN: escaped quotes
+jsx = '<stage ...>' + '<scene ...>'        # FORBIDDEN: concatenation
+```
 """
 
 SYSTEM_PROMPT_RULES = """
@@ -56,7 +79,9 @@ SYSTEM_PROMPT_RULES = """
 - If VisualFeedbackTool rejects the composition, fix the JSX and call VideoEditorTool again, then
   re-check with VisualFeedbackTool.
 - Once VisualFeedbackTool approves (`render_decision: true`), call VideoEditorTool one more time
-  with `render=True` (and no `jsx` change) to export the final video.
+  with `render=True` (and no `jsx` change) to export the final video. Then call
+  `final_answer("<absolute path of the exported mp4>")`.
+- Work efficiently: aim to finish within 12 tool calls. Never repeat an identical tool call.
 """
 
 def get_system_prompt():
